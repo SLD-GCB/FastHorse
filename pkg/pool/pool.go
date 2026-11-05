@@ -176,6 +176,11 @@ func (p *Pool) handleFailure(conn *connection) {
 	if p.cfg.DisableRotateFailure {
 		return
 	}
+	// Do not close a connection with streams in flight: one failed stream must
+	// not tear down the others. Replace it only after it is idle.
+	if conn.inflight.Load() > 0 {
+		return
+	}
 	for i, item := range p.conns {
 		if item != conn {
 			continue
@@ -262,6 +267,10 @@ func (p *Pool) sample() {
 		}
 		if !conn.healthy.Load() && time.Since(conn.lastFailed) > time.Minute {
 			conn.healthy.Store(true)
+			conn.draining.Store(false)
+		}
+		if !conn.healthy.Load() && conn.inflight.Load() == 0 {
+			conn.draining.Store(true)
 		}
 	}
 }

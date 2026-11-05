@@ -26,6 +26,15 @@ func (c *streamConn) Close() error {
 	return nil
 }
 
+// CloseWrite closes the request side only. mux transports use half-close to
+// signal the end of their preface while keeping the response side readable.
+func (c *streamConn) CloseWrite() error {
+	if c.closeFn != nil {
+		c.closeFn()
+	}
+	return nil
+}
+
 func (c *streamConn) LocalAddr() net.Addr              { return streamAddr("kuaima-local") }
 func (c *streamConn) RemoteAddr() net.Addr             { return streamAddr("kuaima-remote") }
 func (c *streamConn) SetDeadline(time.Time) error      { return nil }

@@ -34,11 +34,13 @@ type Config struct {
 	Obfs           obfs.Config
 	Gate           gate.Config
 	ReceiveWindow  uint64
+	UploadBytesPerSecond int
 }
 
 // Client 维护一条 H2 连接，所有 CONNECT 流复用它。
 type Client struct {
 	cfg       Config
+	tlsConfig *tls.Config
 	transport *http2.Transport
 }
 
@@ -50,6 +52,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	transport := &http2.Transport{
 		TLSClientConfig: tlsConfig,
+		ReadIdleTimeout: 10 * time.Second,
+		PingTimeout:     5 * time.Second,
 		DialTLSContext: func(ctx context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
 			raw, err := (&net.Dialer{}).DialContext(ctx, network, address)
 			if err != nil {
@@ -73,10 +77,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 				_ = conn.Close()
 				return nil, fmt.Errorf("kuaima: tls handshake: %w", err)
 			}
-			return tlsConn, nil
+			return newWriteLimitConn(tlsConn, cfg.UploadBytesPerSecond), nil
 		},
 	}
-	return &Client{cfg: cfg, transport: transport}, nil
+	return &Client{cfg: cfg, tlsConfig: tlsConfig, transport: transport}, nil
 }
 
 func clientTLS(cfg Config) (*tls.Config, error) {
