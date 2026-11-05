@@ -1,57 +1,63 @@
-# 快马 Kuaima
+# FastHorse（快马）第二代
 
-TCP + obfs + 动态门 + TLS 1.3 + H2 CONNECT 的代理协议原型。
-
-## 结构
+快马是一个 **TCP + 混淆 + 动态门 + TLS 1.3 + H2 CONNECT** 的代理协议，定位是 UDP 被封时的 TCP 兜底。
 
 ```
 TCP
 └── obfs（ChaCha20，时间窗口轮换）
     └── 动态门（时间戳 + nonce + HMAC）
-        └── TLS 1.3（自签 + 信任根）
-            └── H2 CONNECT（cronet 全双工）
+        └── TLS 1.3
+            └── H2 CONNECT（原生多流）
+```
+
+## 第二代的变化
+
+第一代使用连接池：多条 H2 连接、按在途流选连接、定时补连接。第二代改为 **单条 H2 连接 + 原生多流**，把复用交回 H2，不再自己维护连接池。
+
+| 能力 | 第一代 | 第二代 |
+|---|---|---|
+| 连接模型 | 多连接池 | 单 H2 连接，原生多流 |
+| 并发控制 | 按在途流选连接 | 客户端流信号量 + 服务端 H2 并发流限制 |
+| 连接切换 | 失败/降速触发换连接 | 只保留端口轮换，替换底层连接 |
+| 限速 | `target_mbps` 目标值 | `up_mbps` / `down_mbps` 令牌桶，真实限速 |
+| 端口轮换 | 定时 + 失败 + 降速 | 仅显式开启；默认关闭，端口数 <= 1 不轮换 |
+| 客户端实现 | cronet / 连接池 | 纯 Go H2，无需 libcronet |
+| 内核适配 | 无 | `type: "fasthorse"`，面板可下发 |
+
+## 结构
+
+```
+cmd/            CLI
+internal/       服务端、配置
+pkg/client/     纯 Go 客户端（H2 多流、raw TLS、限速）
+pkg/wire/       H2 CONNECT、流封装、TLS
+pkg/obfs/       混淆
+pkg/gate/       动态门
+pkg/pool/       旧连接池（保留兼容）
 ```
 
 ## 构建
 
 ```bash
-# 服务端 / 无 cronet
+go build ./...
 go build ./cmd/kuaima
-
-# 客户端（需要 libcronet）
-go build -tags with_purego ./cmd/kuaima
 ```
 
-`libcronet` 需要放在可执行文件同目录或 PATH 中。
+不再需要 `libcronet`。
 
 ## 服务端
 
 ```json
 {
   "listen": "0.0.0.0",
-  "port_range": "20000-20002",
+  "listen_port_range": "20000:20002",
   "certificate_path": "/etc/kuaima/cert.pem",
   "key_path": "/etc/kuaima/key.pem",
-  "obfs_password": "change-me",
-  "obfs_keys": [
-    { "id": 1, "password": "old-key-for-rotation" }
-  ],
-  "obfs_rotation_seconds": 3600,
-  "obfs_tolerance_seconds": 3600,
-  "obfs_pad_to": 1024,
+  "obfs": { "password": "change-me" },
+  "gate": { "node_id": "hk-01" },
   "users": [
-    { "name": "alice", "password": "change-me-too" }
-  ],
-  "policy": {
-    "allow_private": false,
-    "allow_loopback": false,
-    "allowed_ports": []
-  },
-  "guard": {
-    "max_connections_per_ip": 64
-  },
-  "failure_mode": "drop",
-  "failure_delay_ms": 1500
+    { "username": "alice", "password": "change-me-too" }
+  ]
 }
 ```
 
@@ -63,72 +69,58 @@ kuaima serve -c server.json
 
 ```json
 {
-  "listen": "127.0.0.1:1080",
-  "server_name": "kuaima",
+  "type": "fasthorse",
+  "server": "1.2.3.4",
+  "server_port": 20000,
+  "server_ports": ["20000", "20001", "20002"],
   "username": "alice",
   "password": "change-me-too",
-  "certificate_path": "/etc/kuaima/cert.pem",
-  "obfs_password": "change-me",
-  "obfs_key_id": 0,
-  "obfs_rotation_seconds": 3600,
-  "obfs_tolerance_seconds": 3600,
-  "obfs_pad_to": 1024,
-  "connections_per_entry": 2,
-  "max_connections": 8,
-  "target_mbps": 200,
-  "receive_window_mb": 16,
-  "port_rotate_seconds": 600,
-  "entries": [
-    { "server": "1.2.3.4", "port_range": "20000-20002" },
-    { "server": "5.6.7.8", "port_range": "20000-20002" }
-  ]
+  "obfs": { "password": "change-me" },
+  "gate": { "node_id": "hk-01" },
+  "tls": { "enabled": true, "server_name": "kuaima", "insecure": true },
+  "max_streams_per_connection": 64,
+  "port_hop_enabled": false,
+  "port_rotate_seconds": 120,
+  "up_mbps": 50,
+  "down_mbps": 300
 }
 ```
 
-```bash
-kuaima client -c client.json
-```
-
-客户端在 `127.0.0.1:1080` 提供 SOCKS5 CONNECT。
+- `max_streams_per_connection`：客户端并发流信号量，服务端 H2 `MaxConcurrentStreams` 同步限制；
+- `up_mbps`：客户端聚合上行限速；
+- `down_mbps`：服务端发往该客户端连接的聚合下行限速；
+- `port_hop_enabled` 不写或 `false` 都不轮换；端口数 <= 1 强制不轮换。
 
 ## 吞吐策略
 
-TCP 不做每连接限速，目标是跑满：
+快马跑在系统 TCP 上，拥塞控制由操作系统决定，协议层不提供 Brutal：
 
-- 每条连接不设速率上限；
-- 连接池每秒采样吞吐，按在途流和实测速率选择连接；
-- 总吞吐低于 `target_mbps × 85%` 时自动加连接，最高 `max_connections`；
-- 总吞吐高于 `target_mbps × 95%` 且有空闲连接时，30 秒后回收；
-- H2 接收窗口默认 16 MB，服务端连接/流窗口 3 MB；
-- TCP 收发缓冲 4 MB；
-- `port_rotate_seconds` 到期后把空闲连接换成同入口的下一个端口，带 10% 抖动；有流在跑的连接先排空，不中断现有连接。
+- 客户端 H2 单连接，所有 CONNECT 流共享同一条 TCP；
+- 上行在客户端按 `up_mbps` 令牌桶限速；
+- 下行在服务端按 `down_mbps` 对整条 H2 连接限速；
+- H2 服务端接收窗口：连接 / 单流 3 MB，帧 1 MB；
+- 客户端 TLS 收发缓冲 4 MB；
+- 端口轮换只替换底层连接，默认关闭。
 
 ## 已完成
 
-- obfs：ChaCha20、16 KiB 分块、时间窗口轮换；
-- 动态门：128 字节记录、HMAC-SHA256、时间窗、nonce 防重放；
-- TLS 1.3 + 自签信任根；
+- 纯 Go H2 CONNECT，客户端无需 cronet；
+- 专用 TLS + `FHMX` 魔数，避免 H2 CONNECT 承载 mux 的流取消问题；
 - 服务端：端口段监听、Basic 用户校验、目标策略、每 IP 连接数；
-- 客户端：cronet H2 全双工、多入口连接池、按在途流选择连接、失败切换；
-- CLI：`serve` / `client` / `version`。
-
-## 隐蔽与轮换
-
-- `failure_mode`：`drop`（默认，探测看到超时）、`reset`、`close`；
-- `failure_delay_ms`：drop 模式下的基础延迟，再加 0~1 秒随机抖动；
-- H2 认证/配额失败不再返回 403/404，直接断流；
-- 端口轮换触发：定时、拨号失败立即换、吞吐低于峰值 1/3 持续 5 秒；
-- `disable_rotate_on_failure` / `disable_rotate_on_degrade` 可关闭对应触发；
-- 混淆密钥带头部版本号，服务端 `obfs_keys` 可同时接受旧版本，客户端 `obfs_key_id` 选当前版本；
-- `obfs_pad_to`：开启后所有块按 1 KiB / 4 KiB / 16 KiB 三档补齐，大流量块也统一到 16 KiB，`-1` 关闭；
-- 活连接读写错误立即替换连接，不必等下次拨号；
-- 服务端每 5 秒检查配置，用户、密钥、配额热加载，已有连接继续用完；
-- 服务端启动时校验证书 SAN 与 `server_name` 一致。
+- 客户端：单连接多流、流并发上限、失败重连；
+- 限速：客户端上行、服务端下行；
+- 端口轮换：显式开启，默认关闭；
+- sing-box 适配：`type: "fasthorse"`，面板/订阅可下发。
 
 ## 限制
 
-- 客户端必须 `with_purego` + `libcronet`；
-- 自签证书有效期不超过 398 天（当前 90 天）；
+- TCP 拥塞控制由系统决定，无法按连接指定 BBR/Brutal；
+- 单连接共享 TCP 拥塞窗口，丢包时所有流一起降速；
+- 自签证书有效期不超过 398 天；
 - 内层 Basic 是静态密码，动态性由外层门提供；
-- 暂无配额和每连接限速；
-- 暂无 sing-box 内核适配、面板和订阅。
+- 无配额和每用户限速；
+- 没有 `connections` / `target_mbps` 字段：已由单连接多流和上下行限速取代。
+
+## 许可
+
+见 [LICENSE](LICENSE)。
